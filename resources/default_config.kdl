@@ -1,0 +1,42 @@
+bar {
+    position "top"
+    height 32
+    multi-monitor false
+}
+
+modules-left {
+    workspaces {
+        format "{name}"
+        on-click "wiri-ctl focus-workspace-named {name}"
+        on-scroll-up "wiri-ctl focus-workspace-previous"
+        on-scroll-down "wiri-ctl focus-workspace-next"
+    }
+}
+
+modules-center {
+    focused-window {
+        format "{title}"
+        max-length 60
+    }
+}
+
+modules-right {
+    clock {
+        format "%H:%M"
+        interval-ms 30000
+    }
+    battery {
+        format "{icon} {percent}%"
+        interval-ms 60000
+    }
+}
+
+style {
+    background "#1e1e1eee"
+    foreground "#ffffff"
+    accent "#7fc8ff"
+    font-family "Segoe UI"
+    font-size-pt 10
+    padding-px 8
+    module-spacing-px 12
+}
