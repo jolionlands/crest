@@ -5,10 +5,14 @@
 //! concrete type when [`ModuleRegistry::build`] is called.
 
 use std::sync::{Arc, RwLock};
+use parking_lot::RwLock as ParkingRwLock;
+
+use crate::aurora_ipc::AuroraState;
 
 use super::{
     ModuleRegistry,
     WiriState,
+    aurora_wallpaper::AuroraWallpaperModule,
     battery::BatteryModule,
     clock::ClockModule,
     cpu::CpuModule,
@@ -25,7 +29,12 @@ use super::{
 ///
 /// `wiri_state` is shared with the modules that display window-manager state
 /// (workspaces, focused-window).
-pub fn register_all(registry: &mut ModuleRegistry, wiri_state: Arc<RwLock<WiriState>>) {
+/// `aurora_state` is shared with the aurora-wallpaper module.
+pub fn register_all(
+    registry: &mut ModuleRegistry,
+    wiri_state: Arc<RwLock<WiriState>>,
+    aurora_state: Arc<ParkingRwLock<AuroraState>>,
+) {
     // clock
     registry.register("clock", Box::new(|entry| Box::new(ClockModule::new(entry))));
 
@@ -65,6 +74,15 @@ pub fn register_all(registry: &mut ModuleRegistry, wiri_state: Arc<RwLock<WiriSt
         registry.register(
             "focused-window",
             Box::new(move |entry| Box::new(FocusedWindowModule::new(entry, Arc::clone(&state)))),
+        );
+    }
+
+    // aurora-wallpaper — aurora IPC state-driven
+    {
+        let astate = Arc::clone(&aurora_state);
+        registry.register(
+            "aurora-wallpaper",
+            Box::new(move |entry| Box::new(AuroraWallpaperModule::new(entry, Arc::clone(&astate)))),
         );
     }
 }

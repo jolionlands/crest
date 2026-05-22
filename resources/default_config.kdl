@@ -21,6 +21,9 @@ modules-center {
 }
 
 modules-right {
+    aurora-wallpaper {
+        max-length 30
+    }
     clock {
         format "%H:%M"
         interval-ms 30000

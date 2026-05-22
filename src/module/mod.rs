@@ -12,6 +12,7 @@ pub mod network;
 pub mod volume;
 pub mod tray;
 pub mod custom;
+pub mod aurora_wallpaper;
 pub mod builtins;
 pub mod runtime;
 
