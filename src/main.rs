@@ -28,6 +28,7 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use crest::aurora_ipc::AuroraClient;
 use crest::bar::window::{Bar, Rect};
 use crest::config;
+use crest::control_ipc::ControlServer;
 use crest::hooks::StartupManager;
 use crest::module::builtins;
 use crest::module::ModuleRegistry;
@@ -105,6 +106,7 @@ fn main() -> Result<()> {
     // 4. Config
     let config = config::load_config()?;
     let multi_monitor = config.bar.multi_monitor;
+    let config_path = config::config_path();
     let config = Arc::new(RwLock::new(config));
 
     // 5. wiri IPC
@@ -154,8 +156,52 @@ fn main() -> Result<()> {
         handles.push(handle);
     }
 
-    // 8. Wait for Ctrl+C
-    ctrlc_wait();
+    // 8. wiri reserve_area handshake — best-effort, failure just means overlap.
+    {
+        let cfg = config.read();
+        if cfg.bar.reserve_in_wiri {
+            let bar_height = cfg.bar.height;
+            let side = if cfg.bar.position == "bottom" { "bottom" } else { "top" };
+            drop(cfg); // release read lock before I/O
+            let req = serde_json::json!({
+                "type": "reserve_area",
+                "side": side,
+                "pixels": bar_height,
+            });
+            match crest::wiri_ipc::send_request(req) {
+                Ok(resp) => {
+                    if resp.get("success").and_then(|v| v.as_bool()) == Some(true) {
+                        info!("wiri reserved {} px on {} for crest", bar_height, side);
+                    } else {
+                        tracing::warn!("wiri rejected reserve_area: {:?}", resp);
+                    }
+                }
+                Err(e) => {
+                    info!("wiri not running ({}); bar will overlap tiles", e);
+                }
+            }
+        }
+    }
+
+    // 9. Control IPC server — handles crest-ctl status / reload / quit.
+    let (quit_tx, mut quit_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    {
+        let server = ControlServer {
+            config: Arc::clone(&config),
+            config_path,
+            quit_tx,
+        };
+        std::thread::spawn(move || server.run());
+    }
+
+    // 10. Wait for quit signal (from crest-ctl quit) or Ctrl+C.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // recv() returns None only when all senders are dropped (i.e. server
+        // thread panicked).  Either case means we should exit.
+        quit_rx.recv().await;
+        info!("crest received quit signal");
+    });
 
     info!("crest exiting");
     Ok(())
@@ -175,15 +221,6 @@ fn init_tracing(verbose: bool) {
         .with(fmt::layer().with_writer(std::io::stderr))
         .with(filter)
         .init();
-}
-
-/// Block until the bar threads finish (or the process is killed).
-fn ctrlc_wait() {
-    // Park the main thread; bar threads run their own message loops.
-    // On Ctrl+C the OS delivers SIGINT which terminates the process.
-    loop {
-        std::thread::park();
-    }
 }
 
 // ---------------------------------------------------------------------------

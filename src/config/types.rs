@@ -14,6 +14,7 @@ pub struct BarConfig {
     pub height: u32,
     pub multi_monitor: bool, // if true: one bar per monitor; else primary only
     pub click_through: bool, // WS_EX_TRANSPARENT
+    pub reserve_in_wiri: bool, // if true: send reserve_area handshake to wiri on startup
 }
 
 #[derive(Debug, Clone, Default)]
@@ -63,6 +64,7 @@ impl Default for BarConfig {
             height: 32,
             multi_monitor: false,
             click_through: false,
+            reserve_in_wiri: true,
         }
     }
 }

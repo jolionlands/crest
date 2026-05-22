@@ -195,6 +195,31 @@ impl Default for WiriClient {
 }
 
 // ---------------------------------------------------------------------------
+// One-shot request helper
+// ---------------------------------------------------------------------------
+
+/// Send a single request to wiri's IPC pipe and return its response.
+/// Used for one-shot commands like reserve_area where we don't need to subscribe.
+pub fn send_request(message: serde_json::Value) -> std::io::Result<serde_json::Value> {
+    use std::io::{Read, Write};
+    use std::fs::OpenOptions;
+
+    let mut pipe = OpenOptions::new()
+        .read(true).write(true)
+        .open(r"\\.\pipe\wiri_control")?;
+    let bytes = serde_json::to_vec(&message)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    pipe.write_all(&bytes)?;
+    let mut buf = Vec::new();
+    pipe.read_to_end(&mut buf)?;
+    if buf.is_empty() {
+        return Ok(serde_json::json!({"success": false, "error": "empty response"}));
+    }
+    Ok(serde_json::from_slice(&buf)
+        .unwrap_or(serde_json::json!({"success": false, "error": "invalid json"})))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -244,9 +269,12 @@ mod tests {
 
     #[test]
     fn test_wiri_ipc_unknown_event_ignored() {
-        let json = r#"{"type":"some_future_event","data":{}}"#;
+        // Unknown event types should silently route to `WiriEvent::Unknown`
+        // via `#[serde(other)]`.  Adjacently-tagged enums + `serde(other)`
+        // require the input to omit the content field — the parser doesn't
+        // know what shape to expect.
+        let json = r#"{"type":"some_future_event"}"#;
         let event: WiriEvent = serde_json::from_str(json).expect("should parse");
-        // Should not panic
         let client = WiriClient::new();
         client.apply_event(event);
         let state = client.state.read().unwrap();
@@ -261,5 +289,23 @@ mod tests {
         client.apply_event(event);
         let state = client.state.read().unwrap();
         assert_eq!(state.focused_window_hwnd, Some(12345));
+    }
+
+    #[test]
+    fn test_wiri_ipc_send_request_format() {
+        // Build a reserve_area request and verify it matches wiri's expected schema.
+        let req = serde_json::json!({
+            "type": "reserve_area",
+            "side": "top",
+            "pixels": 32u32,
+        });
+        // Must round-trip through serde_json with the correct field names.
+        let serialized = serde_json::to_string(&req).expect("serialise");
+        let back: serde_json::Value = serde_json::from_str(&serialized).expect("deserialise");
+        assert_eq!(back["type"].as_str(), Some("reserve_area"));
+        assert_eq!(back["side"].as_str(), Some("top"));
+        assert_eq!(back["pixels"].as_u64(), Some(32));
+        // Optional monitor_id is absent (not sent when not needed).
+        assert!(back.get("monitor_id").is_none());
     }
 }

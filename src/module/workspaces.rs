@@ -113,6 +113,7 @@ mod tests {
             workspaces: workspaces.iter().map(|s| s.to_string()).collect(),
             focused_workspace: focused,
             focused_window_title: String::new(),
+            focused_window_hwnd: None,
         }))
     }
 

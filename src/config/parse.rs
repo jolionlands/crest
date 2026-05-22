@@ -141,6 +141,9 @@ fn apply_bar_property(key: &str, value: &str, bar: &mut BarConfig) {
         "click-through" | "click_through" => {
             bar.click_through = parse_bool(value);
         }
+        "reserve-in-wiri" | "reserve_in_wiri" => {
+            bar.reserve_in_wiri = parse_bool(value);
+        }
         _ => {}
     }
 }
@@ -305,9 +308,11 @@ mod tests {
         assert_eq!(cfg.modules.left[0].kind, "workspaces");
         assert_eq!(cfg.modules.center.len(), 1);
         assert_eq!(cfg.modules.center[0].kind, "focused-window");
-        assert_eq!(cfg.modules.right.len(), 2);
-        assert_eq!(cfg.modules.right[0].kind, "clock");
-        assert_eq!(cfg.modules.right[1].kind, "battery");
+        // Right zone now includes aurora-wallpaper as the first entry (round 3).
+        assert_eq!(cfg.modules.right.len(), 3);
+        assert_eq!(cfg.modules.right[0].kind, "aurora-wallpaper");
+        assert_eq!(cfg.modules.right[1].kind, "clock");
+        assert_eq!(cfg.modules.right[2].kind, "battery");
     }
 
     #[test]
