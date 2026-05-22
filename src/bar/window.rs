@@ -17,17 +17,31 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, MSG, PostQuitMessage, RegisterClassExW,
-    TranslateMessage, GWLP_USERDATA, HMENU, WNDCLASSEXW, WM_DESTROY, WM_LBUTTONUP,
-    WM_MBUTTONUP, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_SIZE,
+    GetWindowLongPtrW, SetWindowLongPtrW, KillTimer, SetTimer,
+    MSG, PostQuitMessage, RegisterClassExW,
+    TranslateMessage, GWLP_USERDATA, HMENU, WNDCLASSEXW,
+    WM_CREATE, WM_DESTROY, WM_LBUTTONUP, WM_MBUTTONUP,
+    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_SIZE, WM_TIMER,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::config::types::Config;
-use crate::module::{BarRegion, ModuleEvent, ModuleSnapshot, ModuleState};
+use crate::module::runtime::ModuleRuntime;
+use crate::module::{ModuleEvent, ModuleSnapshot};
 
 use super::renderer::Direct2DRenderer;
+
+// ---------------------------------------------------------------------------
+// Timer ID
+// ---------------------------------------------------------------------------
+
+/// Timer ID for the 250 ms module-tick poll.
+const MODULE_TICK_TIMER_ID: usize = 1;
+
+/// Tick interval in milliseconds: 250 ms is granular enough for all built-in
+/// modules (fastest at 100 ms) while keeping CPU load negligible.
+const MODULE_TICK_INTERVAL_MS: u32 = 250;
 
 /// Simple axis-aligned rectangle.
 #[derive(Debug, Clone, Copy, Default)]
@@ -49,15 +63,16 @@ impl Rect {
 /// instance on the stack in `create`.
 struct WindowState {
     config: Arc<RwLock<Config>>,
-    modules: Arc<Mutex<Vec<ModuleState>>>,
+    runtime: Arc<Mutex<ModuleRuntime>>,
     renderer: *mut Direct2DRenderer,
+    bar_width: u32,
 }
 
 /// A single status bar window.
 pub struct Bar {
     pub hwnd: HWND,
     pub config: Arc<RwLock<Config>>,
-    pub modules_state: Arc<Mutex<Vec<ModuleState>>>,
+    runtime: Arc<Mutex<ModuleRuntime>>,
     renderer: Box<Direct2DRenderer>,
     _monitor_bounds: Rect,
 }
@@ -67,13 +82,20 @@ impl Bar {
     ///
     /// `monitor_bounds` is the physical pixel rect of the target monitor
     /// (obtained from `EnumDisplayMonitors` / `MONITORINFO.rcMonitor`).
-    pub fn create(config: Arc<RwLock<Config>>, monitor_bounds: Rect) -> Result<Self> {
-        let (position, height, click_through) = {
+    ///
+    /// `registry` is the fully-populated module registry from `main.rs`.
+    pub fn create(
+        config: Arc<RwLock<Config>>,
+        registry: Arc<crate::module::ModuleRegistry>,
+        monitor_bounds: Rect,
+    ) -> Result<Self> {
+        let (position, height, click_through, modules_config) = {
             let cfg = config.read();
             (
                 cfg.bar.position.clone(),
                 cfg.bar.height,
                 cfg.bar.click_through,
+                cfg.modules.clone(),
             )
         };
 
@@ -105,7 +127,11 @@ impl Bar {
             | WS_EX_NOACTIVATE
             | WS_EX_TOOLWINDOW
             | WS_EX_TOPMOST
-            | if click_through { WS_EX_TRANSPARENT } else { windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0) };
+            | if click_through {
+                WS_EX_TRANSPARENT
+            } else {
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0)
+            };
 
         let hwnd = unsafe {
             CreateWindowExW(
@@ -124,16 +150,19 @@ impl Bar {
             )?
         };
 
+        // Build the module runtime from the config + registry.
+        let runtime = Arc::new(Mutex::new(
+            ModuleRuntime::new(&modules_config, &registry),
+        ));
+
         // Initialise renderer
         let style = config.read().style.clone();
-        let mut renderer = Box::new(Direct2DRenderer::new(hwnd, (width, height), &style)?);
-
-        let modules_state = Arc::new(Mutex::new(Vec::new()));
+        let renderer = Box::new(Direct2DRenderer::new(hwnd, (width, height), &style)?);
 
         Ok(Self {
             hwnd,
             config,
-            modules_state,
+            runtime,
             renderer,
             _monitor_bounds: monitor_bounds,
         })
@@ -141,9 +170,35 @@ impl Bar {
 
     /// Show the window and run the Win32 message pump.  **Blocks** until the
     /// window is destroyed — call from a dedicated thread.
-    pub fn run_message_loop(&self) {
+    pub fn run_message_loop(&mut self) {
         use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
         unsafe { ShowWindow(self.hwnd, SW_SHOWNOACTIVATE) };
+
+        // Install WindowState into GWLP_USERDATA so the WndProc can access it.
+        // Safety: `state` lives on this stack frame for the duration of the
+        // message loop, and the WndProc is only called from GetMessageW below.
+        let mut state = WindowState {
+            config: Arc::clone(&self.config),
+            runtime: Arc::clone(&self.runtime),
+            renderer: self.renderer.as_mut() as *mut Direct2DRenderer,
+            bar_width: self._monitor_bounds.width,
+        };
+        unsafe {
+            SetWindowLongPtrW(
+                self.hwnd,
+                GWLP_USERDATA,
+                &mut state as *mut WindowState as isize,
+            );
+        }
+
+        // Kick off the 250 ms module-tick timer.
+        unsafe {
+            SetTimer(self.hwnd, MODULE_TICK_TIMER_ID, MODULE_TICK_INTERVAL_MS, None);
+        }
+
+        // Force an initial paint so the bar isn't blank while waiting for the
+        // first timer fire.
+        unsafe { InvalidateRect(self.hwnd, None, false) };
 
         let mut msg = MSG::default();
         loop {
@@ -155,6 +210,12 @@ impl Bar {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
+        }
+
+        // Tear down before returning.
+        unsafe {
+            KillTimer(self.hwnd, MODULE_TICK_TIMER_ID);
+            SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
         }
     }
 
@@ -170,9 +231,9 @@ impl Bar {
 
 /// The Win32 window procedure.
 ///
-/// We keep this thin: only WM_PAINT delegates to the renderer; mouse events
-/// dispatch to the module hit-tested under the cursor.  Everything else falls
-/// through to `DefWindowProcW`.
+/// WM_TIMER  → tick all modules; if any changed, invalidate the window.
+/// WM_PAINT  → pull fresh snapshots from the runtime and repaint via D2D.
+/// Mouse     → dispatch through the module runtime's event handler.
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -180,19 +241,35 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_CREATE => {
+            // Nothing extra — WindowState is installed after CreateWindowExW
+            // returns, in run_message_loop.
+            LRESULT(0)
+        }
+
+        WM_TIMER => {
+            if wparam.0 == MODULE_TICK_TIMER_ID {
+                let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+                if !ptr.is_null() {
+                    let state = &*ptr;
+                    let changed = state.runtime.lock().tick();
+                    if changed {
+                        InvalidateRect(hwnd, None, false);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let _hdc = BeginPaint(hwnd, &mut ps);
 
-            // Retrieve WindowState via GWLP_USERDATA (set after Bar::create).
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
             if !ptr.is_null() {
                 let state = &*ptr;
                 let style = state.config.read().style.clone();
-                let snapshots: Vec<ModuleSnapshot> = {
-                    let modules = state.modules.lock();
-                    modules.iter().map(|m| m.snapshot.clone()).collect()
-                };
+                let snapshots: Vec<ModuleSnapshot> = state.runtime.lock().snapshots();
                 let _ = (*state.renderer).paint(&snapshots, &style);
             }
 
@@ -206,29 +283,35 @@ unsafe extern "system" fn wnd_proc(
             if width > 0 && height > 0 {
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
                 if !ptr.is_null() {
-                    let _ = (*(*ptr).renderer).resize((width, height));
+                    let state = &mut *ptr;
+                    state.bar_width = width;
+                    let _ = (*state.renderer).resize((width, height));
                 }
             }
             LRESULT(0)
         }
 
         WM_LBUTTONUP => {
-            dispatch_mouse_event(hwnd, lparam, ModuleEvent::LeftClick);
+            dispatch_mouse_event(hwnd, lparam, wparam, ModuleEvent::LeftClick);
             LRESULT(0)
         }
         WM_RBUTTONUP => {
-            dispatch_mouse_event(hwnd, lparam, ModuleEvent::RightClick);
+            dispatch_mouse_event(hwnd, lparam, wparam, ModuleEvent::RightClick);
             LRESULT(0)
         }
         WM_MBUTTONUP => {
-            dispatch_mouse_event(hwnd, lparam, ModuleEvent::MiddleClick);
+            dispatch_mouse_event(hwnd, lparam, wparam, ModuleEvent::MiddleClick);
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
             // High word of wParam is wheel delta; positive = scroll up.
             let delta = ((wparam.0 >> 16) as i16) as i32;
-            let event = if delta > 0 { ModuleEvent::ScrollUp } else { ModuleEvent::ScrollDown };
-            dispatch_mouse_event(hwnd, lparam, event);
+            let event = if delta > 0 {
+                ModuleEvent::ScrollUp
+            } else {
+                ModuleEvent::ScrollDown
+            };
+            dispatch_mouse_event(hwnd, lparam, wparam, event);
             LRESULT(0)
         }
 
@@ -241,9 +324,15 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
-/// Hit-test which module the cursor lands on and fire its event handler.
-/// If the handler returns a command string, spawn it via `cmd /C`.
-unsafe fn dispatch_mouse_event(hwnd: HWND, lparam: LPARAM, event: ModuleEvent) {
+/// Dispatch a mouse/scroll event through the module runtime.
+///
+/// If the runtime returns a command string, spawn it via `cmd /C`.
+unsafe fn dispatch_mouse_event(
+    hwnd: HWND,
+    lparam: LPARAM,
+    _wparam: WPARAM,
+    event: ModuleEvent,
+) {
     let cursor_x = (lparam.0 & 0xFFFF) as i32;
 
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
@@ -251,21 +340,14 @@ unsafe fn dispatch_mouse_event(hwnd: HWND, lparam: LPARAM, event: ModuleEvent) {
         return;
     }
     let state = &*ptr;
-    let mut modules = state.modules.lock();
+    let bar_w = state.bar_width;
 
-    // Find the module whose pixel_range contains cursor_x
-    for module_state in modules.iter_mut() {
-        let (x0, x1) = module_state.pixel_range;
-        if cursor_x >= x0 as i32 && cursor_x < x1 as i32 {
-            // We can't call trait methods here because we only have ModuleState
-            // (snapshot + range). The actual module tick loop owns the Box<dyn Module>.
-            // Store the event in a side channel for the runtime to pick up.
-            // For now, log it — the runtime integration comes in main.rs.
-            debug!(
-                "mouse event {:?} on module at [{},{}]",
-                event, x0, x1
-            );
-            break;
-        }
+    let cmd = state.runtime.lock().dispatch_event(cursor_x, bar_w, event);
+
+    if let Some(cmd_str) = cmd {
+        debug!("spawning on-event command: {}", cmd_str);
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", &cmd_str])
+            .spawn();
     }
 }

@@ -78,8 +78,8 @@ fn main() -> Result<()> {
         let reg = Arc::clone(&registry);
 
         let handle = std::thread::spawn(move || {
-            match Bar::create(cfg, bounds) {
-                Ok(bar) => bar.run_message_loop(),
+            match Bar::create(cfg, reg, bounds) {
+                Ok(mut bar) => bar.run_message_loop(),
                 Err(e) => tracing::error!("failed to create bar: {e}"),
             }
         });

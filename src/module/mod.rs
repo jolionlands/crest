@@ -13,6 +13,7 @@ pub mod volume;
 pub mod tray;
 pub mod custom;
 pub mod builtins;
+pub mod runtime;
 
 // ---------------------------------------------------------------------------
 // WiriState — shared IPC state from the window manager.
